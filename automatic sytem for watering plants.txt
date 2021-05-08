@@ -1,0 +1,211 @@
+void setup()
+{
+
+  // Serial
+  Serial.begin(9600);
+
+  // Blynk 
+  Blynk.begin(auth, ssid, pass);
+
+  // fetch stored data from server
+  Blynk.syncVirtual(V0);
+  Blynk.syncVirtual(V7);
+  Blynk.syncVirtual(V30);
+  Blynk.syncVirtual(V31);
+  Blynk.syncVirtual(V32);
+  Blynk.syncVirtual(V33);
+  Blynk.syncVirtual(V34);
+  Blynk.syncVirtual(V35);
+
+  // Sensors
+  Wire.begin(D1, D2);  // SDA, SCL
+  if (!adc.init()) {
+    Serial.println("ADS1115 not connected!");
+  }
+  adc.setVoltageRange_mV(ADS1115_RANGE_6144);
+  
+  // timers
+  timer.setInterval(30000L, control);     // for control loop, run every 30 secs
+  timer1.setInterval(5000L, readSensors); // for sensor read loop, run every 5 sec
+
+  // RTC
+  setSyncInterval(10 * 60);               // Sync interval in seconds (10 minutes)
+  
+  // pin assignments
+  pinMode(D7, OUTPUT);
+  pinMode(D4, OUTPUT);
+  pinMode(D5, OUTPUT);
+  pinMode(D6, OUTPUT);
+
+  // set pumps to OFF (active-low)
+  digitalWrite(D7, HIGH);
+  digitalWrite(D4, HIGH);
+  digitalWrite(D5, HIGH);
+  digitalWrite(D6, HIGH);
+
+  // Set a reasonable start value for sensors (a little above the triggering threshold)
+  for (int i = 0; i < 4; i++) {
+    sensor[i] = thresh[i] + 10;
+  }
+
+  Serial.println("Setup Complete");
+}
+
+void control () 
+{
+  // check if system is on
+  if (systemOn) {
+    
+    // check if it's time to water
+    for (int i = 0; i < 4; i++) {
+      if (plantCheck(i)) {
+        // yes -> execute water routine
+        water(i);
+      }
+    }
+  }
+}
+
+
+bool plantCheck (int plant) 
+{
+  // find elapsed time since last water
+  long elapsedTime = now() - lastWater[plant];
+
+  // check if in auto mode
+  if (modes[plant] == 2 and elapsedTime > minInterval[plant] * 60 * 60 and sensor[plant] < thresh[plant]) {
+    // minimun interval exceed and moisturelevels too low -> time to water!
+    return true;
+  }
+
+  // check if in timer mode
+  else if (modes[plant] == 3 and elapsedTime > interval[plant] * 60 * 60 * 24) {
+    // time interval has been exceeded -> time to water:
+    return true;
+  }
+
+  // no hit, no water
+  return false;
+}
+
+
+void water(int plant) 
+{
+  Serial.print("Watering plant "); Serial.println(plant + 1);
+
+  // set flag (used for status update)
+  pumpOn[plant] = true;
+
+  // push-update status in app and then turn pump on, and
+  switch (plant) {
+    case 0:
+      Blynk.virtualWrite(V11, getStatus(plant));
+      digitalWrite(D6, LOW);
+      break;
+    case 1:
+      Blynk.virtualWrite(V12, getStatus(plant));
+      digitalWrite(D5, LOW);
+      break;
+    case 2:
+      Blynk.virtualWrite(V13, getStatus(plant));
+      digitalWrite(D4, LOW);
+      break;
+    case 3:
+      Blynk.virtualWrite(V14, getStatus(plant));
+      digitalWrite(D7, LOW);
+      break;
+  }
+
+  // delay loop
+  long startTime = millis();
+  while (millis() - startTime < waterdur(plant)) {
+    // keep everything running in the meantime (except the control loop)
+    Blynk.run();
+    timer1.run();
+  }
+
+  // remove flag
+  pumpOn[plant] = false;
+
+  // turn pump off and push new status
+  switch (plant) {
+    case 0:
+      digitalWrite(D6, HIGH);  
+      Blynk.virtualWrite(V11, getStatus(plant));
+      break;
+    case 1:
+      digitalWrite(D5, HIGH);  
+      Blynk.virtualWrite(V12, getStatus(plant));
+      break;
+    case 2:
+      digitalWrite(D4, HIGH);  
+      Blynk.virtualWrite(V13, getStatus(plant));
+      break;
+    case 3:
+      digitalWrite(D7, HIGH);  
+      Blynk.virtualWrite(V14, getStatus(plant));
+      break;
+  }
+
+  // Reset water button (if used)
+  Blynk.virtualWrite(V8, 0);
+
+  // update lastwater to server
+  lastWater[plant] = now();
+  Blynk.virtualWrite(V34, lastWater[0], lastWater[1], lastWater[2], lastWater[3]);
+}
+
+
+int waterdur (int plant) 
+{
+  // convert ml to ms for controlling pump on-time, different values depending on the chosen pump
+
+  switch (plant) {
+    case 0:
+      return amount[plant] * 57 + 350; // set experimentally
+    case 1:
+      return amount[plant] * 50 + 320; // set experimentally
+    case 2:
+      return amount[plant] * 59 + 350; // set experimentally
+    case 3:
+      return amount[plant] * 47 + 340; // set experimentallyl
+  } 
+}
+
+void readSensors() 
+{
+  float reading[4];
+
+  // read raw values
+  reading[0] = readChannel(ADS1115_COMP_0_GND);
+  reading[1] = readChannel(ADS1115_COMP_1_GND);
+  reading[2] = readChannel(ADS1115_COMP_2_GND);
+  reading[3] = readChannel(ADS1115_COMP_3_GND);
+
+  // convert to percentage, filter and constrain (if we got a rouge reading)
+  for (int i = 0; i<4; i++) 
+  {
+    reading[i] = map(reading[i], sensorDry[i], sensorWet[i], 0, 100);
+    sensor[i] = tf * reading[i] + (1 - tf) * sensor[i];
+    sensor[i] = constrain(sensor[i], 0, 100);
+  }
+
+  // Write to server
+  Blynk.virtualWrite(V21, sensor[0]); 
+  Blynk.virtualWrite(V22, sensor[1]); 
+  Blynk.virtualWrite(V23, sensor[2]); 
+  Blynk.virtualWrite(V24, sensor[3]); 
+}
+
+
+float readChannel(ADS1115_MUX channel) 
+{
+  float voltage = 0.0;
+  adc.setCompareChannels(channel);
+  adc.startSingleMeasurement();
+  while (adc.isBusy()) {
+    Blynk.run(); // nope!
+}
+  voltage = adc.getResult_mV(); 
+  return voltage;
+}
